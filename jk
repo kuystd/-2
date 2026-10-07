@@ -1,0 +1,538 @@
+-- Services
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+
+local player = Players.LocalPlayer
+local running = false
+local loopEnabled = true
+local points = {}
+
+-- Settings
+local walkSpeed = 16 -- ความเร็วเริ่มต้น
+local promptDelay = 0.3 -- เวลาหน่วงก่อนกด Prompt
+local customHoldTime = 0.5 -- เวลาในการกดค้าง (วินาที)
+local overrideHoldDuration = false -- ใช้เวลาการกดค้างแบบกำหนดเองหรือไม่
+
+-- Load Rayfield Library
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Window = Rayfield:CreateWindow({
+    Name = "ระบบรับ-วางไม้ออโต้ + หลบรั้ว/สิ่งกีดขวาง",
+    LoadingTitle = "สคริปต์เดินออโต้",
+    LoadingSubtitle = "แก้ไขระบบหลบรั้ว และบังคับเลี้ยวอ้อมสิ่งกีดขวาง",
+    ConfigurationSaving = {
+        Enabled = false,
+    },
+    Discord = {
+        Enabled = false,
+    },
+    KeySystem = false
+})
+
+--========================
+-- Helper Functions
+--========================
+
+local function applyWalkSpeed(humanoid)
+    if humanoid then
+        humanoid.WalkSpeed = walkSpeed
+    end
+end
+
+-- ฟังก์ชันบังคับเดินถอยหลังและเลี้ยวเบี่ยงหลบเมื่อติดสิ่งกีดขวาง/รั้ว
+local function forceSteerAround(humanoid, root)
+    if not humanoid or not root then return end
+    
+    -- หยุดการเดินตามเส้นทางเดิมชั่วคราว
+    humanoid:MoveTo(root.Position)
+    
+    -- สุ่มทิศทางเลี้ยวเบี่ยง (ซ้าย หรือ ขวา)
+    local isLeft = math.random(1, 2) == 1
+    local dodgeDirection = isLeft and -root.CFrame.RightVector or root.CFrame.RightVector
+    
+    -- เดินถอยหลังนิดหน่อย แล้วเลี้ยวออกข้าง
+    humanoid:Move(-root.CFrame.LookVector, false)
+    task.wait(0.4)
+    
+    humanoid:Move(dodgeDirection, false)
+    task.wait(0.8)
+    
+    humanoid:Move(Vector3.new(0, 0, 0), false)
+end
+
+-- ตรวจสอบด้วย Raycast ว่ามีสิ่งกีดขวางข้างหน้าหรือไม่
+local function isObstacleAhead(root)
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterDescendantsInstances = {player.Character}
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    -- ยิง Ray ไปข้างหน้า 4 หน่วย
+    local rayResult = workspace:Raycast(root.Position, root.CFrame.LookVector * 4, raycastParams)
+    return rayResult ~= nil
+end
+
+-- ฟังก์ชันเดินไปยังตำแหน่งเป้าหมายพร้อมระบบหลบสิ่งกีดขวาง/รั้ว
+local function walkTo(position)
+    local character = player.Character or player.CharacterAdded:Wait()
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+
+    if not humanoid or not root then return false end
+
+    applyWalkSpeed(humanoid)
+
+    -- ตั้งค่า Pathfinding: ปิด AgentCanJump หรือตั้งค่าเตี้ยๆ เพื่อให้คำนวณทางเดินอ้อมรั้วแทนการกระโดดชน
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 3,         -- เพิ่มขนาดจำลองของตัวละครให้เดินห่างจากขอบรั้วมากขึ้น
+        AgentHeight = 6,
+        AgentCanJump = false,    -- บังคับไม่ให้คำนวณการกระโดดข้ามรั้ว (ให้เดินอ้อมแทน)
+        AgentMaxSlope = 45
+    })
+
+    local success, err = pcall(function()
+        path:ComputeAsync(root.Position, position)
+    end)
+
+    if not success or path.Status ~= Enum.PathStatus.Success then
+        -- ถ้าสร้างเส้นทางไม่ได้ แสดงว่าติดรั้วอยู่ ให้ถอยแล้วเลี้ยวออกข้างก่อนคำนวณใหม่
+        forceSteerAround(humanoid, root)
+        return false
+    end
+
+    local waypoints = path:GetWaypoints()
+
+    for i, waypoint in ipairs(waypoints) do
+        if not running then return false end
+
+        applyWalkSpeed(humanoid)
+
+        humanoid:MoveTo(waypoint.Position)
+
+        local startTime = tick()
+        local lastPos = Vector3.new(root.Position.X, 0, root.Position.Z) -- คิดเฉพาะแนวนอน X, Z
+
+        while running and (tick() - startTime < 5) do
+            local currentPosFlat = Vector3.new(root.Position.X, 0, root.Position.Z)
+            local targetPosFlat = Vector3.new(waypoint.Position.X, 0, waypoint.Position.Z)
+            
+            local distance = (currentPosFlat - targetPosFlat).Magnitude
+            if distance <= 2.5 then
+                break
+            end
+
+            -- 1. ตรวจจับ Raycast ชนรั้ว/สิ่งกีดขวางตรงหน้า
+            -- 2. ตรวจจับการติดแนวนอน (X, Z ไม่ขยับเกิน 1.2 วินาที)
+            if (tick() - startTime > 1.2) and (currentPosFlat - lastPos).Magnitude < 0.5 then
+                forceSteerAround(humanoid, root)
+                return walkTo(position) -- คำนวณเส้นทางเดินอ้อมใหม่ทันที
+            end
+
+            task.wait(0.1)
+        end
+    end
+
+    humanoid:MoveTo(root.Position)
+    return true
+end
+
+-- ฟังก์ชันค้นหา ProximityPrompt ในระยะ
+local function getNearestPrompt(position)
+    local nearest = nil
+    local nearestDistance = 12
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") and obj.Enabled then
+            local parent = obj.Parent
+            if parent and parent:IsA("BasePart") then
+                local distance = (parent.Position - position).Magnitude
+                if distance < nearestDistance then
+                    nearestDistance = distance
+                    nearest = obj
+                end
+            end
+        end
+    end
+
+    return nearest
+end
+
+-- ฟังก์ชันกด Prompt 1 ครั้ง (สำหรับจุดที่ 1)
+local function triggerPromptOnce(position)
+    local prompt = getNearestPrompt(position)
+    if not prompt then return false end
+
+    task.wait(promptDelay)
+    local holdTime = overrideHoldDuration and customHoldTime or (prompt.HoldDuration > 0 and (prompt.HoldDuration + 0.1) or 0.1)
+
+    if fireproximityprompt then
+        fireproximityprompt(prompt)
+    else
+        prompt:InputHoldBegin()
+        task.wait(holdTime)
+        prompt:InputHoldEnd()
+    end
+
+    return true
+end
+
+-- ฟังก์ชันกด Prompt ซ้ำเรื่อยๆ จนกว่าปุ่มจะหายไป (สำหรับจุดที่ 2 เป็นต้นไป)
+local function triggerPromptRepeatedly(position, statusCallback)
+    local prompt = getNearestPrompt(position)
+
+    if not prompt then
+        return false
+    end
+
+    local pressCount = 0
+
+    while running and prompt and prompt.Parent and prompt.Enabled do
+        pressCount = pressCount + 1
+        if statusCallback then
+            statusCallback("กำลังกดครั้งที่ " .. pressCount)
+        end
+
+        task.wait(promptDelay)
+
+        local holdTime = overrideHoldDuration and customHoldTime or (prompt.HoldDuration > 0 and (prompt.HoldDuration + 0.1) or 0.1)
+
+        if fireproximityprompt then
+            fireproximityprompt(prompt)
+        else
+            prompt:InputHoldBegin()
+            task.wait(holdTime)
+            prompt:InputHoldEnd()
+        end
+
+        task.wait(0.2)
+        prompt = getNearestPrompt(position)
+    end
+
+    return true
+end
+
+-- รีเซ็ต WalkSpeed เมื่อเกิดใหม่
+player.CharacterAdded:Connect(function(char)
+    local hum = char:WaitForChild("Humanoid", 5)
+    if hum then
+        applyWalkSpeed(hum)
+    end
+end)
+
+--========================
+-- UI Elements
+--========================
+
+local MainTab = Window:CreateTab("หน้าหลัก", 4483362458)
+local ConfigTab = Window:CreateTab("ตั้งค่าตัวละคร/การกด", 4483362458)
+local SettingsTab = Window:CreateTab("จุดพิกัด", 4483362458)
+
+local tempX, tempY, tempZ = 0, 0, 0
+local tempWait = 1
+
+MainTab:CreateSection("ควบคุมการทำงาน")
+
+local StatusParagraph = MainTab:CreateParagraph({
+    Title = "สถานะระบบ", 
+    Content = "สถานะ: พร้อมทำงาน | จุดทั้งหมด: 0 จุด | วนซ้ำ: เปิด"
+})
+
+local function updateStatus(msg)
+    local loopText = loopEnabled and "เปิด" or "ปิด"
+    StatusParagraph:Set({
+        Title = "สถานะระบบ",
+        Content = string.format("สถานะ: %s | จุดทั้งหมด: %d จุด | วนซ้ำ: %s", msg, #points, loopText)
+    })
+end
+
+MainTab:CreateToggle({
+    Name = "🔁 เดินวนซ้ำไม่จำกัด (Loop Infinity)",
+    CurrentValue = true,
+    Flag = "LoopToggle",
+    Callback = function(Value)
+        loopEnabled = Value
+        updateStatus(running and "กำลังทำงาน..." or "พร้อมทำงาน")
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "▶ เริ่มทำงาน (START)",
+    Callback = function()
+        if running then
+            Rayfield:Notify({Title = "แจ้งเตือน", Content = "ระบบกำลังทำงานอยู่แล้ว!", Duration = 3})
+            return
+        end
+
+        if #points < 2 then
+            Rayfield:Notify({Title = "แจ้งเตือน", Content = "กรุณาเพิ่มอย่างน้อย 2 จุด! (จุดที่ 1 = รับไม้, จุดที่ 2 = วางไม้)", Duration = 3})
+            return
+        end
+
+        running = true
+        task.spawn(function()
+            local loopCount = 1
+
+            while running do
+                local currentIndex = 1
+
+                while currentIndex <= #points and running do
+                    local point = points[currentIndex]
+                    local loopInfo = string.format(" (รอบที่ %d)", loopCount)
+
+                    if currentIndex == 1 then
+                        -- จุดที่ 1: รับไม้ (กด 1 ครั้ง)
+                        updateStatus("กำลังเดินไปรับไม้ที่จุด 1 (กด 1 ครั้ง)" .. loopInfo)
+                        local success = walkTo(point.position)
+
+                        if success and running then
+                            updateStatus("ถึงจุด 1 - กำลังกดรับไม้ 1 ครั้ง...")
+                            
+                            local triggered = triggerPromptOnce(point.position)
+
+                            if triggered then
+                                Rayfield:Notify({
+                                    Title = "รับไม้สำเร็จ", 
+                                    Content = "กดรับไม้ที่จุด 1 เรียบร้อย (1 ครั้ง)", 
+                                    Duration = 1.5
+                                })
+                            else
+                                Rayfield:Notify({
+                                    Title = "แจ้งเตือน", 
+                                    Content = "ไม่พบปุ่มกดที่จุด 1", 
+                                    Duration = 1.5
+                                })
+                            end
+
+                            task.wait(point.waitTime)
+                            currentIndex = 2 -- เดินไปจุดวางไม้จุดที่ 2
+                        end
+                    else
+                        -- จุดที่ 2+: วางไม้ (กดเรื่อยๆ)
+                        updateStatus("กำลังเดินไปวางไม้ที่จุดที่ " .. currentIndex .. loopInfo)
+                        local success = walkTo(point.position)
+
+                        if success and running then
+                            updateStatus("ถึงจุด " .. currentIndex .. " - กำลังวางไม้เรื่อยๆ...")
+
+                            local placedWood = triggerPromptRepeatedly(point.position, function(msg)
+                                updateStatus("จุดวางไม้ที่ " .. currentIndex .. ": " .. msg)
+                            end)
+
+                            if placedWood then
+                                Rayfield:Notify({
+                                    Title = "วางไม้เสร็จสิ้น", 
+                                    Content = "ไม่มีปุ่มวางเหลือที่จุด " .. currentIndex .. " -> กลับไปรับไม้จุด 1", 
+                                    Duration = 1.5
+                                })
+                            else
+                                Rayfield:Notify({
+                                    Title = "ไม่พบปุ่มวางไม้", 
+                                    Content = "ไม่มีปุ่มที่จุด " .. currentIndex .. " -> กลับไปรับไม้จุด 1", 
+                                    Duration = 1.5
+                                })
+                            end
+
+                            task.wait(point.waitTime)
+                            currentIndex = 1 -- กลับไปรับไม้จุด 1
+                        end
+                    end
+                end
+
+                if not loopEnabled or not running then
+                    break
+                end
+
+                loopCount = loopCount + 1
+                task.wait(0.5)
+            end
+
+            running = false
+            updateStatus("ทำงานเสร็จสิ้นเรียบร้อย")
+        end)
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "■ หยุดทำงาน (STOP)",
+    Callback = function()
+        running = false
+        updateStatus("หยุดการทำงานแล้ว")
+    end,
+})
+
+-- Configuration Tab
+ConfigTab:CreateSection("ตั้งค่าความเร็วตัวละคร")
+
+ConfigTab:CreateSlider({
+    Name = "⚡ ความเร็วในการเดิน (WalkSpeed)",
+    Range = {16, 200},
+    Increment = 1,
+    Suffix = " WalkSpeed",
+    CurrentValue = 16,
+    Flag = "WalkSpeedSlider",
+    Callback = function(Value)
+        walkSpeed = Value
+        local char = player.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.WalkSpeed = walkSpeed
+            end
+        end
+    end,
+})
+
+ConfigTab:CreateSection("ตั้งค่าการกดปุ่ม (ProximityPrompt)")
+
+ConfigTab:CreateInput({
+    Name = "⏱️ ระยะเวลารอก่อนกดแต่ละครั้ง (วินาที)",
+    PlaceholderText = "0.3 (แนะนำ 0.2 - 0.5)",
+    RemoveTextOnFocus = false,
+    Callback = function(Text)
+        promptDelay = tonumber(Text) or 0.3
+    end,
+})
+
+ConfigTab:CreateToggle({
+    Name = "⚙️ ใช้เวลากดค้างแบบกำหนดเอง (Override Hold)",
+    CurrentValue = false,
+    Flag = "OverrideHoldToggle",
+    Callback = function(Value)
+        overrideHoldDuration = Value
+    end,
+})
+
+ConfigTab:CreateSlider({
+    Name = "⏳ ระยะเวลากดปุ่มค้าง (Hold Duration)",
+    Range = {0.1, 5},
+    Increment = 0.1,
+    Suffix = " วินาที",
+    CurrentValue = 0.5,
+    Flag = "HoldDurationSlider",
+    Callback = function(Value)
+        customHoldTime = Value
+    end,
+})
+
+-- Points Management
+SettingsTab:CreateSection("เพิ่มจุดพิกัด (จุด 1 = รับไม้ | จุด 2 = วางไม้)")
+
+SettingsTab:CreateButton({
+    Name = "➕ เพิ่มจุดจากตำแหน่งที่ยืนอยู่ทันที",
+    Callback = function()
+        local character = player.Character
+        if character and character:FindFirstChild("HumanoidRootPart") then
+            local pos = character.HumanoidRootPart.Position
+            local x = math.floor(pos.X * 10) / 10
+            local y = math.floor(pos.Y * 10) / 10
+            local z = math.floor(pos.Z * 10) / 10
+
+            table.insert(points, {
+                position = Vector3.new(x, y, z),
+                waitTime = tempWait
+            })
+
+            local pointType = #points == 1 and "(จุดรับไม้ - กด 1 ครั้ง)" or "(จุดวางไม้ - กดเรื่อยๆ)"
+            updateStatus("บันทึกจุดพิกัดใหม่แล้ว")
+            Rayfield:Notify({
+                Title = "เพิ่มพิกัดสำเร็จ", 
+                Content = string.format("จุดที่ %d %s: (%.1f, %.1f, %.1f)", #points, pointType, x, y, z), 
+                Duration = 3
+            })
+        else
+            Rayfield:Notify({
+                Title = "ข้อผิดพลาด", 
+                Content = "ไม่พบตัวละครของคุณ", 
+                Duration = 3
+            })
+        end
+    end,
+})
+
+SettingsTab:CreateSection("ตั้งค่า / กำหนดพิกัดเอง")
+
+SettingsTab:CreateButton({
+    Name = "📍 ดึงพิกัดปัจจุบันใส่ช่องกรอกด้านล่าง",
+    Callback = function()
+        local character = player.Character
+        if character and character:FindFirstChild("HumanoidRootPart") then
+            local pos = character.HumanoidRootPart.Position
+            tempX = math.floor(pos.X * 10) / 10
+            tempY = math.floor(pos.Y * 10) / 10
+            tempZ = math.floor(pos.Z * 10) / 10
+            
+            Rayfield:Notify({
+                Title = "ดึงพิกัดสำเร็จ", 
+                Content = string.format("X: %.1f, Y: %.1f, Z: %.1f", tempX, tempY, tempZ), 
+                Duration = 3
+            })
+        end
+    end,
+})
+
+SettingsTab:CreateInput({
+    Name = "พิกัด X",
+    PlaceholderText = "กรอก X",
+    RemoveTextOnFocus = false,
+    Callback = function(Text)
+        tempX = tonumber(Text) or tempX
+    end,
+})
+
+SettingsTab:CreateInput({
+    Name = "พิกัด Y",
+    PlaceholderText = "กรอก Y",
+    RemoveTextOnFocus = false,
+    Callback = function(Text)
+        tempY = tonumber(Text) or tempY
+    end,
+})
+
+SettingsTab:CreateInput({
+    Name = "พิกัด Z",
+    PlaceholderText = "กรอก Z",
+    RemoveTextOnFocus = false,
+    Callback = function(Text)
+        tempZ = tonumber(Text) or tempZ
+    end,
+})
+
+SettingsTab:CreateInput({
+    Name = "เวลารอหลังถึงจุด (วินาที)",
+    PlaceholderText = "1",
+    RemoveTextOnFocus = false,
+    Callback = function(Text)
+        tempWait = tonumber(Text) or 1
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name = "+ บันทึกจุดพิกัดจากช่องกรอก",
+    Callback = function()
+        if not tempX or not tempY or not tempZ then
+            Rayfield:Notify({Title = "ข้อผิดพลาด", Content = "กรุณากรอกพิกัด X, Y, Z ให้ถูกต้อง", Duration = 3})
+            return
+        end
+
+        table.insert(points, {
+            position = Vector3.new(tempX, tempY, tempZ),
+            waitTime = tempWait
+        })
+
+        local pointType = #points == 1 and "(จุดรับไม้ - กด 1 ครั้ง)" or "(จุดวางไม้ - กดเรื่อยๆ)"
+        updateStatus("เพิ่มจุดพิกัดแล้ว")
+        Rayfield:Notify({
+            Title = "สำเร็จ", 
+            Content = string.format("เพิ่มจุดที่ %d %s เรียบร้อยแล้ว", #points, pointType), 
+            Duration = 2
+        })
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name = "🗑️ ลบจุดพิกัดทั้งหมด",
+    Callback = function()
+        points = {}
+        updateStatus("ลบจุดพิกัดทั้งหมดแล้ว")
+        Rayfield:Notify({Title = "สำเร็จ", Content = "ลบรายการจุดพิกัดทั้งหมดแล้ว", Duration = 2})
+    end,
+})
