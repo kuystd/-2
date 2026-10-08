@@ -1,0 +1,330 @@
+--// Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+
+--// Rayfield UI Load
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Window = Rayfield:CreateWindow({
+    Name = "BZ HeadLock & ESP",
+    LoadingTitle = "Initializing...",
+    LoadingSubtitle = "by BluezyGPT",
+    ConfigurationSaving = { Enabled = true, FolderName = "BZConfig", FileName = "HeadLock" },
+    Discord = { Enabled = false },
+    KeySystem = false
+})
+
+--// Tabs
+local CombatTab = Window:CreateTab("Combat", "target")
+local VisualsTab = Window:CreateTab("Visuals", "eye")
+local SettingsTab = Window:CreateTab("Settings", "settings")
+
+--// State
+local State = {
+    HeadLockEnabled = false,
+    ESPEnabled = false,
+    TeamCheck = true,
+    LockPart = "Head",
+    LockPositionMode = "Above Head", -- "Above Head" | "Below Player" | "Center of Target"
+    CustomOffset = Vector3.new(0, 3, 0),
+    Smoothness = 0.15,
+    FOV = 120,
+    ShowFOV = true,
+    ESPColor = Color3.fromRGB(255, 0, 0),
+    ESPTransparency = 0.5
+}
+
+local ESPObjects = {}
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Visible = false
+FOVCircle.Radius = State.FOV
+FOVCircle.Thickness = 2
+FOVCircle.Color = Color3.fromRGB(255, 255, 255)
+FOVCircle.Filled = false
+
+--// Helpers
+local function GetCharacterBounds(character)
+    local parts = {}
+    for _, obj in pairs(character:GetDescendants()) do
+        if obj:IsA("BasePart") then table.insert(parts, obj) end
+    end
+    if #parts == 0 then return nil, nil end
+    
+    local min = parts[1].Position
+    local max = parts[1].Position
+    for _, part in pairs(parts) do
+        local pos = part.Position
+        local size = part.Size / 2
+        min = Vector3.new(math.min(min.X, pos.X - size.X), math.min(min.Y, pos.Y - size.Y), math.min(min.Z, pos.Z - size.Z))
+        max = Vector3.new(math.max(max.X, pos.X + size.X), math.max(max.Y, pos.Y + size.Y), math.max(max.Z, pos.Z + size.Z))
+    end
+    local center = (min + max) / 2
+    local height = max.Y - min.Y
+    return center, height, min, max
+end
+
+local function CalculateLockPosition(target)
+    if not target or not target.Character then return nil end
+    local character = target.Character
+    local part = character:FindFirstChild(State.LockPart)
+    if not part then return nil end
+
+    local mode = State.LockPositionMode
+    local basePos = part.Position
+
+    if mode == "Above Head" then
+        -- หัว + CustomOffset (default Y=3)
+        return basePos + State.CustomOffset
+
+    elseif mode == "Below Player" then
+        -- ขา/พื้น - CustomOffset.Y
+        local hrp = character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local _, height, min = GetCharacterBounds(character)
+            local footY = min.Y
+            return Vector3.new(basePos.X, footY - State.CustomOffset.Y, basePos.Z)
+        end
+        return basePos - Vector3.new(0, State.CustomOffset.Y, 0)
+
+    elseif mode == "Center of Target" then
+        -- กลางตัว (Bounding Box Center)
+        local center = GetCharacterBounds(character)
+        return center or basePos
+    end
+
+    return basePos + State.CustomOffset
+end
+
+local function GetClosestTarget()
+    local closest = nil
+    local shortestDist = State.FOV
+
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            if State.TeamCheck and player.Team == LocalPlayer.Team then continue end
+            
+            local humanoid = player.Character:FindFirstChild("Humanoid")
+            if humanoid and humanoid.Health <= 0 then continue end
+
+            local lockPos = CalculateLockPosition(player)
+            if not lockPos then continue end
+
+            local screenPos, onScreen = Camera:WorldToViewportPoint(lockPos)
+            if not onScreen then continue end
+
+            local mousePos = UserInputService:GetMouseLocation()
+            local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+
+            if dist < shortestDist then
+                shortestDist = dist
+                closest = player
+            end
+        end
+    end
+    return closest
+end
+
+--// ESP Functions (same as before)
+local function CreateESP(player)
+    if ESPObjects[player] then return end
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "BZ_ESP"
+    highlight.FillColor = State.ESPColor
+    highlight.OutlineColor = Color3.new(1, 1, 1)
+    highlight.FillTransparency = State.ESPTransparency
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "BZ_NameTag"
+    billboard.Size = UDim2.new(0, 200, 0, 50)
+    billboard.StudsOffset = Vector3.new(0, 4, 0)
+    billboard.AlwaysOnTop = true
+    
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, 0, 1, 0)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = player.Name
+    nameLabel.TextColor3 = State.ESPColor
+    nameLabel.TextStrokeTransparency = 0
+    nameLabel.TextScaled = true
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.Parent = billboard
+    
+    ESPObjects[player] = { Highlight = highlight, Billboard = billboard, NameLabel = nameLabel }
+end
+
+local function UpdateESP(player)
+    local data = ESPObjects[player]
+    if not data then return end
+    if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+        local humanoid = player.Character:FindFirstChild("Humanoid")
+        if humanoid and humanoid.Health > 0 then
+            data.Highlight.Adornee = player.Character
+            data.Highlight.Parent = player.Character
+            data.Billboard.Adornee = player.Character.HumanoidRootPart
+            data.Billboard.Parent = player.Character.HumanoidRootPart
+            data.NameLabel.Text = player.Name .. " | " .. math.floor(humanoid.Health)
+            return
+        end
+    end
+    data.Highlight.Parent = nil
+    data.Billboard.Parent = nil
+end
+
+local function RemoveESP(player)
+    local data = ESPObjects[player]
+    if data then
+        data.Highlight:Destroy()
+        data.Billboard:Destroy()
+        ESPObjects[player] = nil
+    end
+end
+
+--// Combat Loop
+RunService.RenderStepped:Connect(function()
+    -- FOV Circle
+    if State.ShowFOV then
+        FOVCircle.Visible = true
+        FOVCircle.Position = UserInputService:GetMouseLocation()
+        FOVCircle.Radius = State.FOV
+    else
+        FOVCircle.Visible = false
+    end
+
+    -- Head Lock
+    if State.HeadLockEnabled and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+        local target = GetClosestTarget()
+        if target then
+            local lockPos = CalculateLockPosition(target)
+            if lockPos then
+                local cameraPos = Camera.CFrame.Position
+                local newCFrame = CFrame.new(cameraPos, lockPos)
+                Camera.CFrame = Camera.CFrame:Lerp(newCFrame, State.Smoothness)
+            end
+        end
+    end
+
+    -- ESP Update
+    if State.ESPEnabled then
+        for _, player in pairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                CreateESP(player)
+                UpdateESP(player)
+            end
+        end
+    else
+        for player, _ in pairs(ESPObjects) do RemoveESP(player) end
+    end
+end)
+
+Players.PlayerRemoving:Connect(RemoveESP)
+
+--// UI: Combat Tab
+CombatTab:CreateToggle({
+    Name = "Head Lock (Hold Right Click)",
+    CurrentValue = false,
+    Callback = function(v) State.HeadLockEnabled = v end
+})
+
+CombatTab:CreateDropdown({
+    Name = "Lock Target Part",
+    Options = {"Head", "HumanoidRootPart", "UpperTorso", "LowerTorso"},
+    CurrentOption = "Head",
+    Callback = function(opt) State.LockPart = opt end
+})
+
+CombatTab:CreateDropdown({
+    Name = "Lock Position Mode",
+    Options = {"Above Head", "Below Player", "Center of Target"},
+    CurrentOption = "Above Head",
+    Callback = function(opt) 
+        State.LockPositionMode = opt
+    end
+})
+
+CombatTab:CreateSlider({
+    Name = "Offset Amount (Studs)",
+    Range = {0, 20},
+    Increment = 0.5,
+    CurrentValue = 3,
+    Callback = function(v) 
+        State.CustomOffset = Vector3.new(0, v, 0)
+    end
+})
+
+CombatTab:CreateSlider({
+    Name = "Smoothness",
+    Range = {0.01, 1},
+    Increment = 0.01,
+    CurrentValue = 0.15,
+    Callback = function(v) State.Smoothness = v end
+})
+
+CombatTab:CreateSlider({
+    Name = "FOV Radius",
+    Range = {50, 500},
+    Increment = 10,
+    CurrentValue = 120,
+    Callback = function(v) State.FOV = v end
+})
+
+CombatTab:CreateToggle({
+    Name = "Team Check",
+    CurrentValue = true,
+    Callback = function(v) State.TeamCheck = v end
+})
+
+CombatTab:CreateToggle({
+    Name = "Show FOV Circle",
+    CurrentValue = true,
+    Callback = function(v) State.ShowFOV = v end
+})
+
+--// UI: Visuals Tab
+VisualsTab:CreateToggle({
+    Name = "Enable ESP (Highlight + NameTag)",
+    CurrentValue = false,
+    Callback = function(v) 
+        State.ESPEnabled = v
+        if not v then for player, _ in pairs(ESPObjects) do RemoveESP(player) end end
+    end
+})
+
+VisualsTab:CreateColorPicker({
+    Name = "ESP Color",
+    Color = State.ESPColor,
+    Callback = function(c) 
+        State.ESPColor = c
+        for _, data in pairs(ESPObjects) do
+            data.Highlight.FillColor = c
+            data.NameLabel.TextColor3 = c
+        end
+    end
+})
+
+VisualsTab:CreateSlider({
+    Name = "ESP Transparency",
+    Range = {0, 1},
+    Increment = 0.05,
+    CurrentValue = 0.5,
+    Callback = function(v) 
+        State.ESPTransparency = v
+        for _, data in pairs(ESPObjects) do data.Highlight.FillTransparency = v end
+    end
+})
+
+--// UI: Settings Tab
+SettingsTab:CreateButton({
+    Name = "Destroy UI & Cleanup",
+    Callback = function()
+        FOVCircle:Remove()
+        for player, _ in pairs(ESPObjects) do RemoveESP(player) end
+        Rayfield:Destroy()
+    end
+})
+
+Rayfield:LoadConfiguration()
