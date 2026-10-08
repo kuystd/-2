@@ -1,0 +1,246 @@
+--// Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+
+--// Rayfield
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+local Window = Rayfield:CreateWindow({
+    Name = "BZ HeadLock", LoadingTitle = "Loading...", LoadingSubtitle = "by BluezyGPT",
+    ConfigurationSaving = { Enabled = true, FolderName = "BZConfig", FileName = "HeadLock" },
+    Discord = { Enabled = false }, KeySystem = false
+})
+local CombatTab = Window:CreateTab("Combat", "target")
+local VisualsTab = Window:CreateTab("Visuals", "eye")
+
+--// State
+local State = {
+    Enabled = false,
+    TeamCheck = true,
+    LockPart = "Head",
+    VerticalMode = "Above Head",   -- "Above Head" | "Below Player" | "Center of Target"
+    VerticalOffset = 3,            -- studs
+    Smoothness = 0.12,
+    FOV = 130,
+    ShowFOV = true,
+    Prediction = true,
+    PredMethod = "Adaptive",
+    PredStrength = 1.0,
+    MaxDist = 500,
+    ESPEnabled = false,
+    ESPColor = Color3.fromRGB(255, 50, 50),
+}
+
+--// Drawing
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Visible = false
+FOVCircle.Radius = State.FOV
+FOVCircle.Thickness = 2
+FOVCircle.Color = Color3.new(1, 1, 1)
+FOVCircle.Filled = false
+
+--// Lock State
+local LockedTarget = nil
+local Holding = false
+
+--// Helpers
+local function ScreenCenter()
+    return Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y * 0.5)
+end
+
+local function GetBounds(char)
+    local parts = {}
+    for _, d in pairs(char:GetDescendants()) do if d:IsA("BasePart") then table.insert(parts, d) end end
+    if #parts == 0 then return nil end
+    local min, max = parts[1].Position, parts[1].Position
+    for _, p in pairs(parts) do
+        local sz = p.Size * 0.5
+        local pos = p.Position
+        min = Vector3.new(math.min(min.X, pos.X - sz.X), math.min(min.Y, pos.Y - sz.Y), math.min(min.Z, pos.Z - sz.Z))
+        max = Vector3.new(math.max(max.X, pos.X + sz.X), math.max(max.Y, pos.Y + sz.Y), math.max(max.Z, pos.Z + sz.Z))
+    end
+    return { Center = (min + max) * 0.5, Min = min, Max = max }
+end
+
+local function BaseLockPos(target)
+    if not target or not target.Character then return nil end
+    local char = target.Character
+    local part = char:FindFirstChild(State.LockPart)
+    if not part then return nil end
+    local mode = State.VerticalMode
+    local p = part.Position
+
+    if mode == "Above Head" then
+        return p + Vector3.new(0, State.VerticalOffset, 0)
+    elseif mode == "Below Player" then
+        local b = GetBounds(char)
+        return b and Vector3.new(p.X, b.Min.Y - State.VerticalOffset, p.Z) or p - Vector3.new(0, State.VerticalOffset, 0)
+    elseif mode == "Center of Target" then
+        local b = GetBounds(char)
+        return b and b.Center or p
+    end
+    return p + Vector3.new(0, State.VerticalOffset, 0)
+end
+
+local function PredictedPos(target, base)
+    if not State.Prediction then return base end
+    local hrp = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return base end
+    local v = hrp.AssemblyLinearVelocity
+    local m = State.PredMethod
+    local s = State.PredStrength
+    if m == "Velocity" then
+        return base + v * (s * 0.03)
+    elseif m == "PingBased" then
+        local ping = LocalPlayer:GetNetworkPing()
+        return base + v * ((ping + 0.03) * s)
+    else -- Adaptive
+        local sp = v.Magnitude
+        local ping = LocalPlayer:GetNetworkPing()
+        local t = math.clamp(ping + sp * 0.001, 0.01, 0.15)
+        return base + v * (t * s)
+    end
+end
+
+local function FinalLockPos(target)
+    local b = BaseLockPos(target)
+    return b and PredictedPos(target, b) or nil
+end
+
+-- Acquisition: ONLY from screen center
+local function AcquireTarget()
+    local center = ScreenCenter()
+    local best, bestDist = nil, State.FOV
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+            if State.TeamCheck and plr.Team == LocalPlayer.Team then continue end
+            local hum = plr.Character:FindFirstChild("Humanoid")
+            if hum and hum.Health <= 0 then continue end
+            local pos = FinalLockPos(plr)
+            if not pos then continue end
+            if (pos - Camera.CFrame.Position).Magnitude > State.MaxDist then continue end
+            local sp, on = Camera:WorldToViewportPoint(pos)
+            if not on then continue end
+            local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+            if d < bestDist then bestDist, best = d, plr end
+        end
+    end
+    return best
+end
+
+local function TargetValid(t)
+    if not t or not t.Character then return false end
+    if not t.Character:FindFirstChild("HumanoidRootPart") then return false end
+    local hum = t.Character:FindFirstChild("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    if State.TeamCheck and t.Team == LocalPlayer.Team then return false end
+    local pos = FinalLockPos(t)
+    if not pos then return false end
+    if (pos - Camera.CFrame.Position).Magnitude > State.MaxDist then return false end
+    local _, on = Camera:WorldToViewportPoint(pos)
+    return on
+end
+
+--// Input
+UserInputService.InputBegan:Connect(function(inp, gp)
+    if gp then return end
+    if inp.UserInputType == Enum.UserInputType.MouseButton2 then
+        Holding = true
+        if State.Enabled then LockedTarget = AcquireTarget() end
+    end
+end)
+UserInputService.InputEnded:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton2 then
+        Holding = false
+        LockedTarget = nil
+    end
+end)
+
+--// Loop
+RunService.RenderStepped:Connect(function()
+    local center = ScreenCenter()
+
+    -- FOV at center screen ONLY
+    FOVCircle.Visible = State.ShowFOV
+    if State.ShowFOV then
+        FOVCircle.Position = center
+        FOVCircle.Radius = State.FOV
+    end
+
+    -- Lock logic
+    if State.Enabled and Holding then
+        -- Keep sticky target, validate each frame
+        if LockedTarget and not TargetValid(LockedTarget) then
+            LockedTarget = nil
+        end
+        if not LockedTarget then
+            LockedTarget = AcquireTarget()
+        end
+
+        if LockedTarget then
+            local pos = FinalLockPos(LockedTarget)
+            if pos then
+                local camPos = Camera.CFrame.Position
+                Camera.CFrame = Camera.CFrame:Lerp(CFrame.new(camPos, pos), State.Smoothness)
+            end
+        end
+    end
+end)
+
+--// ESP (Highlight only, clean)
+local ESP = {}
+Players.PlayerRemoving:Connect(function(plr)
+    if ESP[plr] then ESP[plr]:Destroy() ESP[plr] = nil end
+end)
+
+RunService.RenderStepped:Connect(function()
+    if not State.ESPEnabled then
+        for plr, hl in pairs(ESP) do hl:Destroy() ESP[plr] = nil end
+        return
+    end
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+            local hum = plr.Character:FindFirstChild("Humanoid")
+            if hum and hum.Health > 0 then
+                if not ESP[plr] then
+                    local hl = Instance.new("Highlight")
+                    hl.Name = "BZ_ESP"
+                    hl.FillColor = State.ESPColor
+                    hl.OutlineColor = Color3.new(1,1,1)
+                    hl.FillTransparency = 0.5
+                    hl.OutlineTransparency = 0
+                    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    hl.Adornee = plr.Character
+                    hl.Parent = plr.Character
+                    ESP[plr] = hl
+                else
+                    ESP[plr].Adornee = plr.Character
+                    ESP[plr].FillColor = State.ESPColor
+                end
+            else
+                if ESP[plr] then ESP[plr]:Destroy() ESP[plr] = nil end
+            end
+        end
+    end
+end)
+
+--// UI
+CombatTab:CreateToggle({ Name = "Head Lock (Hold Right Click)", CurrentValue = false, Callback = function(v) State.Enabled = v end })
+CombatTab:CreateDropdown({ Name = "Lock Part", Options = {"Head","HumanoidRootPart","UpperTorso","LowerTorso"}, CurrentOption = "Head", Callback = function(o) State.LockPart = o end })
+CombatTab:CreateDropdown({ Name = "Vertical Mode", Options = {"Above Head","Below Player","Center of Target"}, CurrentOption = "Above Head", Callback = function(o) State.VerticalMode = o end })
+CombatTab:CreateSlider({ Name = "Vertical Offset (Studs)", Range = {0, 20}, Increment = 0.5, CurrentValue = 3, Callback = function(v) State.VerticalOffset = v end })
+CombatTab:CreateSlider({ Name = "Smoothness", Range = {0.01, 1}, Increment = 0.01, CurrentValue = 0.12, Callback = function(v) State.Smoothness = v end })
+CombatTab:CreateToggle({ Name = "Prediction", CurrentValue = true, Callback = function(v) State.Prediction = v end })
+CombatTab:CreateDropdown({ Name = "Prediction Method", Options = {"Velocity","PingBased","Adaptive"}, CurrentOption = "Adaptive", Callback = function(o) State.PredMethod = o end })
+CombatTab:CreateSlider({ Name = "Prediction Strength", Range = {0.1, 3}, Increment = 0.05, CurrentValue = 1.0, Callback = function(v) State.PredStrength = v end })
+CombatTab:CreateSlider({ Name = "FOV Radius", Range = {50, 500}, Increment = 10, CurrentValue = 130, Callback = function(v) State.FOV = v end })
+CombatTab:CreateSlider({ Name = "Max Lock Distance", Range = {100, 2000}, Increment = 50, CurrentValue = 500, Callback = function(v) State.MaxDist = v end })
+CombatTab:CreateToggle({ Name = "Team Check", CurrentValue = true, Callback = function(v) State.TeamCheck = v end })
+CombatTab:CreateToggle({ Name = "Show FOV Circle (Center)", CurrentValue = true, Callback = function(v) State.ShowFOV = v end })
+
+VisualsTab:CreateToggle({ Name = "ESP Highlight", CurrentValue = false, Callback = function(v) State.ESPEnabled = v end })
+VisualsTab:CreateColorPicker({ Name = "ESP Color", Color = State.ESPColor, Callback = function(c) State.ESPColor = c end })
+
+Rayfield:LoadConfiguration()
